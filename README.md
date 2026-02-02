@@ -53,22 +53,49 @@ demo/
 
 ### 스레드 간 관계
 
-```
-[Connector 스레드]          [Monitor 스레드]           [Lambda 스레드]
-  1초마다 동작                 2초마다 폴링               알람 대기
-       │                          │                        │
-       │   ┌──────────────────────┘                        │
-       │   │ 읽을 수 있는 정보:                              │
-       │   │  - connected_metric (1 or 0)                  │
-       │   │  - last_offset_commit (시각)                   │
-       │   │                                               │
-       │   │ 읽을 수 없는 정보:                              │
-       │   │  - _state (SILENT_FAILURE 등 내부 상태)         │
-       │   │  - is_healthy                                 │
-       └───┘                                               │
-                      alarm_event.set() ──────────────────→│
-                                                           │
-                      connector.restart() ←────────────────┘
+```mermaid
+flowchart LR
+    subgraph Connector["🔌 Connector 스레드 (1초 주기)"]
+        C1[정상 producing]
+        C2[Silent Failure 발생]
+        C3["API status: RUNNING\n(외부에서 정상으로 보임)"]
+        C1 -->|랜덤 시점| C2
+        C2 --> C3
+    end
+
+    subgraph Metrics["📊 외부 관찰 가능 메트릭"]
+        M1["connected_metric\n1 → 0"]
+        M2["last_offset_commit\n갱신 중단"]
+    end
+
+    subgraph Hidden["🚫 외부 관찰 불가"]
+        H1["_state = SILENT_FAILURE"]
+        H2["is_healthy = False"]
+    end
+
+    subgraph Monitor["🔍 Monitor 스레드 (2초 폴링)"]
+        MO1{"connected == 0?\nOR\noffset_age >= 5초?"}
+        MO2["ALARM 발생"]
+        MO1 -->|Yes| MO2
+    end
+
+    subgraph Lambda["⚡ Lambda 스레드 (알람 대기)"]
+        L1[alarm_event 수신]
+        L2[커넥터 삭제/재생성]
+        L3[복구 완료]
+        L1 --> L2 --> L3
+    end
+
+    C2 -->|변경| M1
+    C2 -->|중단| M2
+    C2 -.->|내부만 변경| H1
+    C2 -.->|내부만 변경| H2
+
+    M1 -->|폴링| MO1
+    M2 -->|폴링| MO1
+
+    MO2 -->|"alarm_event.set()"| L1
+    L3 -->|"connector.restart()"| C1
 ```
 
 ### Monitor가 보는 것 vs 못 보는 것
