@@ -1,0 +1,332 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  MSK Connect Debezium Silent Failure 자동 감지 및 복구 파이프라인
+  Connected 메트릭 알람 + Offset Commit 로그 알람 → EventBridge → Lambda 자동 복구
+
+Parameters:
+  ConnectorArn:
+    Type: String
+    Description: MSK Connect 커넥터 ARN
+
+  ConnectorConfigS3Bucket:
+    Type: String
+    Description: 커넥터 재생성 설정이 저장된 S3 버킷
+
+  ConnectorConfigS3Key:
+    Type: String
+    Description: 커넥터 재생성 설정 S3 키 (JSON)
+
+  CloudWatchNamespace:
+    Type: String
+    Default: MSK_Connect
+    Description: Debezium Custom Metric Namespace
+
+  DBServerName:
+    Type: String
+    Default: cdc
+    Description: Debezium database.server.name 값
+
+  ConnectorLogGroupName:
+    Type: String
+    Default: /aws/msk-connect/debezium-connector-cdc
+    Description: MSK Connect 커넥터 로그 그룹
+
+  AlertEmail:
+    Type: String
+    Description: 알림 수신 이메일 주소
+
+Resources:
+
+  # ============================================
+  # SNS Topic (알림용)
+  # ============================================
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: debezium-silent-failure-alert
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ============================================
+  # 알람 1: Connected 메트릭 (0이면 알람)
+  # ============================================
+  ConnectedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Debezium-Disconnected-Alert
+      AlarmDescription: >
+        Debezium 커넥터 Connected 메트릭이 0 - Silent Failure 가능성
+      Namespace: !Ref CloudWatchNamespace
+      MetricName: Connected
+      Dimensions:
+        - Name: DBServerName
+          Value: !Ref DBServerName
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # ============================================
+  # 알람 2: Offset Commit 로그 기반
+  # ============================================
+  OffsetCommitMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ConnectorLogGroupName
+      FilterPattern: "Committing offsets for"
+      MetricTransformations:
+        - MetricName: DebeziumOffsetCommitCount
+          MetricNamespace: MSKConnect/Debezium
+          MetricValue: "1"
+          DefaultValue: 0
+
+  OffsetCommitAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Debezium-OffsetCommit-Stopped
+      AlarmDescription: >
+        5분간 Offset Commit이 발생하지 않음 - Silent Failure 가능성
+      Namespace: MSKConnect/Debezium
+      MetricName: DebeziumOffsetCommitCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # ============================================
+  # 알람 3: MilliSecondsBehindSource (보조)
+  # ============================================
+  LagAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Debezium-HighLag-Alert
+      AlarmDescription: >
+        Debezium 처리 지연이 5분 이상 - 데이터 지연 발생
+      Namespace: !Ref CloudWatchNamespace
+      MetricName: MilliSecondsBehindSource
+      Dimensions:
+        - Name: DBServerName
+          Value: !Ref DBServerName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 300000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # ============================================
+  # Lambda 자동 복구 함수
+  # ============================================
+  AutoRecoveryFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: debezium-auto-recovery-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MSKConnectAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kafkaconnect:DescribeConnector
+                  - kafkaconnect:DeleteConnector
+                  - kafkaconnect:CreateConnector
+                Resource: !Ref ConnectorArn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${ConnectorConfigS3Bucket}/${ConnectorConfigS3Key}"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertTopic
+              # CreateConnector에 필요한 추가 권한
+              - Effect: Allow
+                Action:
+                  - kafkaconnect:CreateConnector
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: kafkaconnect.amazonaws.com
+
+  AutoRecoveryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: debezium-auto-recovery
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 600
+      MemorySize: 256
+      Role: !GetAtt AutoRecoveryFunctionRole.Arn
+      Environment:
+        Variables:
+          CONNECTOR_ARN: !Ref ConnectorArn
+          CONNECTOR_CONFIG_S3_BUCKET: !Ref ConnectorConfigS3Bucket
+          CONNECTOR_CONFIG_S3_KEY: !Ref ConnectorConfigS3Key
+          SNS_TOPIC_ARN: !Ref AlertTopic
+      Code:
+        ZipFile: |
+          import json, os, time, boto3
+          from datetime import datetime
+
+          kafkaconnect = boto3.client("kafkaconnect")
+          sns = boto3.client("sns")
+          s3 = boto3.client("s3")
+
+          CONNECTOR_ARN = os.environ["CONNECTOR_ARN"]
+          SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
+          CONFIG_BUCKET = os.environ["CONNECTOR_CONFIG_S3_BUCKET"]
+          CONFIG_KEY = os.environ["CONNECTOR_CONFIG_S3_KEY"]
+
+          def lambda_handler(event, context):
+              print(f"알람 이벤트: {json.dumps(event)}")
+              alarm_name = event.get("detail", {}).get("alarmName", "Unknown")
+
+              # 커넥터 상태 확인
+              try:
+                  info = kafkaconnect.describe_connector(connectorArn=CONNECTOR_ARN)
+                  state = info["connectorState"]
+                  version = info["currentVersion"]
+                  print(f"커넥터 상태: {state}, 버전: {version}")
+              except Exception as e:
+                  notify(f"[ERROR] 커넥터 조회 실패: {e}")
+                  return {"statusCode": 500}
+
+              # 삭제
+              try:
+                  kafkaconnect.delete_connector(connectorArn=CONNECTOR_ARN, currentVersion=version)
+                  print("커넥터 삭제 요청 완료")
+              except Exception as e:
+                  notify(f"[ERROR] 커넥터 삭제 실패: {e}")
+                  return {"statusCode": 500}
+
+              # 삭제 대기
+              for i in range(30):
+                  time.sleep(10)
+                  try:
+                      kafkaconnect.describe_connector(connectorArn=CONNECTOR_ARN)
+                  except kafkaconnect.exceptions.NotFoundException:
+                      print("삭제 확인됨")
+                      break
+                  except Exception:
+                      break
+
+              # 재생성
+              try:
+                  cfg = json.loads(s3.get_object(Bucket=CONFIG_BUCKET, Key=CONFIG_KEY)["Body"].read())
+                  resp = kafkaconnect.create_connector(**cfg)
+                  new_arn = resp["connectorArn"]
+                  notify(f"[RECOVERED] 커넥터 복구 완료\n알람: {alarm_name}\n신규 ARN: {new_arn}")
+                  return {"statusCode": 200, "body": new_arn}
+              except Exception as e:
+                  notify(f"[CRITICAL] 커넥터 재생성 실패! 수동 조치 필요: {e}")
+                  return {"statusCode": 500}
+
+          def notify(msg):
+              try:
+                  sns.publish(TopicArn=SNS_TOPIC_ARN, Subject="[MSK Connect] 자동 복구", Message=msg)
+              except Exception as e:
+                  print(f"SNS 실패: {e}")
+
+  # ============================================
+  # EventBridge Rule: 알람 → Lambda 트리거
+  # ============================================
+  AlarmEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: debezium-silent-failure-trigger
+      Description: CloudWatch 알람 상태 변경 시 Lambda 트리거
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          alarmName:
+            - Debezium-Disconnected-Alert
+            - Debezium-OffsetCommit-Stopped
+          state:
+            value:
+              - ALARM
+      Targets:
+        - Arn: !GetAtt AutoRecoveryFunction.Arn
+          Id: auto-recovery-target
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AutoRecoveryFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AlarmEventRule.Arn
+
+  # ============================================
+  # (선택) 예방적 주기 재시작 스케줄
+  # ============================================
+  ScheduledRestartRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: debezium-scheduled-restart
+      Description: 매일 새벽 2시(KST) 예방적 커넥터 재시작
+      ScheduleExpression: cron(0 17 * * ? *)  # UTC 17:00 = KST 02:00
+      State: DISABLED  # 필요 시 ENABLED로 변경
+      Targets:
+        - Arn: !GetAtt AutoRecoveryFunction.Arn
+          Id: scheduled-restart-target
+          Input: |
+            {
+              "detail": {
+                "alarmName": "Scheduled-Preventive-Restart"
+              }
+            }
+
+  ScheduledLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AutoRecoveryFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledRestartRule.Arn
+
+Outputs:
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+    Description: 알림 SNS Topic ARN
+
+  AutoRecoveryFunctionArn:
+    Value: !GetAtt AutoRecoveryFunction.Arn
+    Description: 자동 복구 Lambda ARN
+
+  ConnectedAlarmName:
+    Value: !Ref ConnectedAlarm
+
+  OffsetCommitAlarmName:
+    Value: !Ref OffsetCommitAlarm
