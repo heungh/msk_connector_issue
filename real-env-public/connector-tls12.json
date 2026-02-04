@@ -1,0 +1,37 @@
+{
+  "name": "aurora-cdc-tls12-test",
+  "config": {
+    "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+    "tasks.max": "1",
+
+    "database.hostname": "your-aurora-cluster.cluster-xxxxxxxxx.ap-northeast-2.rds.amazonaws.com",
+    "database.port": "3306",
+    "database.user": "your_db_user",
+    "database.password": "********",
+    "database.server.id": "22347",
+
+    "topic.prefix": "aurora-cdc-tls12",
+    "database.include.list": "testdb",
+    "table.include.list": "testdb.cdc_test",
+
+    "schema.history.internal.kafka.bootstrap.servers": "b-1.your-msk-cluster.xxxxxx.c3.kafka.ap-northeast-2.amazonaws.com:9092,b-2.your-msk-cluster.xxxxxx.c3.kafka.ap-northeast-2.amazonaws.com:9092",
+    "schema.history.internal.kafka.topic": "aurora-cdc-schema-history-tls12",
+
+    "include.schema.changes": "false",
+    "tombstones.on.delete": "false",
+    "snapshot.mode": "schema_only",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+
+    "heartbeat.interval.ms": "10000",
+    "heartbeat.action.query": "SELECT 1",
+
+    "connect.timeout.ms": "30000",
+
+    "errors.tolerance": "none",
+    "errors.retry.timeout": "60000"
+  }
+}
