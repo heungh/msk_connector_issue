@@ -1,5 +1,67 @@
 # Self-Managed Kafka Connect + Debezium 실제 환경 테스트 요약
 
+---
+
+## 🔴 최종 분석 결과
+
+### 1시간 27분 모니터링 완료 (60회 체크)
+
+| 항목 | TLS 1.3 | TLS 1.2 |
+|------|---------|---------|
+| **실패 횟수** | 29회 | 5회 |
+| **실패율** | **48.3%** | 8.3% |
+| **단독 실패** | **25회** | 0회 |
+| **Thread dump** | 25개 수집 | - |
+
+---
+
+### Thread Dump 상세 분석
+
+#### 메소드 호출 체인 (TLS 1.3 실패 시점)
+
+```
+BinaryLogClient$7.run()                        ← 스레드 메인 루프
+    ↓
+BinaryLogClient.connect()                      ← MySQL 연결 유지
+    ↓
+BinaryLogClient.listenForEventPackets()        ← binlog 이벤트 대기
+    ↓
+ByteArrayInputStream.peek()                    ← 다음 바이트 확인
+    ↓
+SSLSocketImpl$AppInputStream.read()            ← SSL 입력 스트림
+    ↓
+SSLSocketImpl.readApplicationRecord()          ← TLS 앱 데이터 레코드
+    ↓
+SSLSocketInputRecord.bytesInCompletePacket()   ← 패킷 완성 확인 ⚠️
+    ↓
+SSLSocketInputRecord.readHeader()              ← TLS 헤더 파싱
+    ↓
+SSLSocketInputRecord.read()                    ← TLS 레코드 읽기
+    ↓
+NioSocketImpl.park() → Net.poll()              ← OS 레벨 I/O 대기 (여기서 지연)
+```
+
+#### TLS 1.3 단독 실패 원인
+
+| 원인 | 설명 |
+|------|------|
+| **TLS 1.3 레코드 처리** | 모든 레코드 암호화, close_notify 엄격 처리 |
+| **SSLSocketInputRecord.read() 지연** | bytesInCompletePacket()에서 추가 검증 |
+| **Aurora + TLS 1.3 조합** | binlog 레코드 단편화 시 TLS 1.3에서 재조립 지연 |
+| **JDK TLS 1.3 구현** | SSLSocket 구현의 불안정성 (read() 작업 중 지연) |
+
+---
+
+### 최종 권장사항
+
+| 우선순위 | 조치 |
+|---------|------|
+| **1** | Self-Managed Kafka Connect에서 `-Djdk.tls.client.protocols=TLSv1.2` 사용 |
+| **2** | MSK Connect는 JVM 옵션 불가 → Self-Managed 권장 |
+| **3** | REST API 기반 모니터링 + CloudWatch 알람 구축 |
+
+---
+
 ## 테스트 일시
 - 2026-02-04
 
@@ -593,6 +655,154 @@ docker run -d --name self-managed-connect-tls12 \
 │                                                                        │
 └────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Thread Dump 수집 및 분석 방법
+
+### 1. Thread Dump 수집 방법
+
+Debezium 컨테이너는 경량 이미지로 `jstack`이 설치되어 있지 않음. 대신 `kill -3` (SIGQUIT) 신호를 사용하여 Thread dump를 stdout으로 출력.
+
+```bash
+# Thread dump 수집 (SIGQUIT 신호 전송)
+docker kill --signal=QUIT <container_name>
+
+# 2초 대기 후 로그에서 Thread dump 추출
+sleep 2
+docker logs <container_name> --tail 500 > thread_dump_output.log
+```
+
+### 2. TLS 1.3 단독 실패 시 자동 Thread Dump 수집 스크립트
+
+```bash
+#!/bin/bash
+# TLS 1.3 단독 실패 감지 시 자동으로 Thread dump 수집
+
+check_and_collect() {
+    # TLS 1.3 상태 확인
+    TLS13_CDC=$(check_kafka_message "$TLS13_TOPIC" "$TEST_DATA")
+    TLS12_CDC=$(check_kafka_message "$TLS12_TOPIC" "$TEST_DATA")
+
+    # TLS 1.3만 실패한 경우 Thread dump 수집
+    if [ "$TLS13_CDC" = "NOT_FOUND" ] && [ "$TLS12_CDC" = "FOUND" ]; then
+        echo "🚨 TLS 1.3 단독 실패 감지! Thread dump 수집..."
+
+        DUMP_FILE="thread_dump_$(date +%Y%m%d_%H%M%S).log"
+        docker kill --signal=QUIT self-managed-connect
+        sleep 2
+        docker logs self-managed-connect --tail 500 > "$DUMP_FILE"
+
+        echo "Thread dump saved: $DUMP_FILE"
+    fi
+}
+```
+
+### 3. Thread Dump 분석 명령어
+
+```bash
+# 전체 스레드 상태 요약
+grep "java.lang.Thread.State:" thread_dump.log | sort | uniq -c
+
+# BinaryLogClient (binlog 읽기) 스레드 찾기
+grep -A 30 "blc-" thread_dump.log
+
+# SSLSocket 관련 스택 트레이스 찾기
+grep -A 10 "SSLSocket\|ssl" thread_dump.log
+
+# BLOCKED 상태 스레드 찾기 (데드락 확인)
+grep -B 5 -A 20 "BLOCKED" thread_dump.log
+
+# 특정 스레드의 전체 스택 트레이스
+grep -A 50 "blc-.*Thread.State" thread_dump.log
+```
+
+### 4. Thread Dump 분석 결과 해석
+
+#### 스레드 상태 의미
+
+| 상태 | 의미 | 분석 포인트 |
+|------|------|-------------|
+| `RUNNABLE` | 실행 중 또는 실행 대기 | Native Method에서 I/O 대기 가능 |
+| `BLOCKED` | 모니터 락 대기 | 데드락 가능성 확인 |
+| `WAITING` | 무기한 대기 | 조건 충족까지 대기 |
+| `TIMED_WAITING` | 시간 제한 대기 | sleep, wait 등 |
+
+#### TLS 1.3 실패 시 주요 확인 포인트
+
+```
+1. BinaryLogClient 스레드 상태 확인
+   - "blc-" 로 시작하는 스레드 검색
+   - Thread.State: RUNNABLE + Net.poll() = I/O 대기 중
+
+2. SSLSocket 스택 확인
+   - SSLSocketInputRecord.read() 호출 여부
+   - SSLSocketInputRecord.bytesInCompletePacket() 위치
+
+3. CPU 시간 vs 경과 시간 비교
+   - cpu=106ms, elapsed=223s → 대부분 I/O 대기
+   - TLS 1.3 vs TLS 1.2 CPU 사용량 차이 확인
+```
+
+### 5. 실제 분석 예시
+
+```
+"blc-your-aurora-cluster:3306" #62 prio=5 cpu=106.39ms elapsed=223.09s
+   java.lang.Thread.State: RUNNABLE
+        at sun.nio.ch.Net.poll(Native Method)           ← OS 레벨 I/O 대기
+        at sun.nio.ch.NioSocketImpl.park(:191)
+        at sun.nio.ch.NioSocketImpl.implRead(:309)
+        at sun.nio.ch.NioSocketImpl.read(:346)
+        at java.net.Socket$SocketInputStream.read(:1099)
+        at sun.security.ssl.SSLSocketInputRecord.read(:489)      ← TLS 레코드 읽기
+        at sun.security.ssl.SSLSocketInputRecord.readHeader(:483)
+        at sun.security.ssl.SSLSocketInputRecord.bytesInCompletePacket(:70)
+        at sun.security.ssl.SSLSocketImpl.readApplicationRecord(:1461)
+        at sun.security.ssl.SSLSocketImpl$AppInputStream.read(:1066)
+        at com.github.shyiko.mysql.binlog.io.ByteArrayInputStream.peek(:211)
+        at com.github.shyiko.mysql.binlog.BinaryLogClient.listenForEventPackets(:1058)
+        at com.github.shyiko.mysql.binlog.BinaryLogClient.connect(:653)
+        at com.github.shyiko.mysql.binlog.BinaryLogClient$7.run(:954)
+
+분석:
+- cpu=106.39ms, elapsed=223.09s → 0.05% CPU 사용, 나머지는 I/O 대기
+- Net.poll()에서 블로킹 → 네트워크 데이터 대기 중
+- SSLSocketInputRecord.read()에서 TLS 레코드 읽기 시도
+- TLS 1.3에서만 간헐적 지연 발생 (TLS 1.2는 정상)
+```
+
+---
+
+## 관련 소스코드 참조
+
+### JDK SSL/TLS 구현 (OpenJDK)
+
+| 클래스 | 역할 | 소스 위치 |
+|--------|------|-----------|
+| `SSLSocketImpl` | SSL 소켓 구현체 | [SSLSocketImpl.java](https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/sun/security/ssl/SSLSocketImpl.java) |
+| `SSLSocketInputRecord` | TLS 레코드 읽기 | [SSLSocketInputRecord.java](https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/sun/security/ssl/SSLSocketInputRecord.java) |
+| `NioSocketImpl` | NIO 소켓 구현 | [NioSocketImpl.java](https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/sun/nio/ch/NioSocketImpl.java) |
+
+### MySQL Binlog Connector
+
+| 클래스 | 역할 | 소스 위치 |
+|--------|------|-----------|
+| `BinaryLogClient` | MySQL binlog 클라이언트 | [BinaryLogClient.java](https://github.com/shyiko/mysql-binlog-connector-java/blob/master/src/main/java/com/github/shyiko/mysql/binlog/BinaryLogClient.java) |
+| `ByteArrayInputStream` | binlog 데이터 스트림 | [ByteArrayInputStream.java](https://github.com/shyiko/mysql-binlog-connector-java/blob/master/src/main/java/com/github/shyiko/mysql/binlog/io/ByteArrayInputStream.java) |
+
+### Debezium MySQL Connector
+
+| 클래스 | 역할 | 소스 위치 |
+|--------|------|-----------|
+| `BinlogStreamingChangeEventSource` | binlog 스트리밍 | [GitHub - Debezium](https://github.com/debezium/debezium/tree/main/debezium-connector-mysql) |
+| `ChangeEventSourceCoordinator` | CDC 이벤트 조정 | [GitHub - Debezium](https://github.com/debezium/debezium/tree/main/debezium-core) |
+
+### JDK-8241239 버그 관련
+
+| 항목 | 링크 |
+|------|------|
+| JDK 버그 리포트 | https://bugs.openjdk.org/browse/JDK-8241239 |
+| Apache Flink 이슈 | https://issues.apache.org/jira/browse/FLINK-38904 |
 
 ---
 
